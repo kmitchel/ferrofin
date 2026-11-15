@@ -20,12 +20,24 @@ to the DVB devices. Stop any service using the adapters before scanning them.
 python3 scripts/scan-linux-dvb.py ./channels.conf
 ```
 
-The scanner covers RF channels 2-36 and splits them across accessible adapters.
-Use `--adapter 0` to pick one adapter, `--rf 25 32` to scan specific RF channels,
-or `--skip-vhf` to scan UHF only. It checks signal once per frequency and keeps
-weak multiplexes as comments. Use `--include-weak` to keep those services
-enabled. If the driver reports a lock without C/N in dB, the scanner keeps
-the services and reports the missing measurement.
+The default scan covers RF channels 2-36 and splits them across accessible
+adapters. To narrow the scan using RabbitEars station hints, pass a five-digit
+U.S. ZIP code.
+
+```sh
+python3 scripts/scan-linux-dvb.py ./channels.conf --zip 46725
+```
+
+The optional lookup sends the supplied ZIP code to RabbitEars. If the lookup
+fails or returns no usable frequencies, the scanner sweeps the full selected
+band. Omit `--zip` for an offline scan or to look for frequencies outside the
+hints. Use `--rf 25 32` to scan specific RF channels instead of a ZIP lookup.
+Use `--adapter 0` to pick one adapter or `--skip-vhf` to scan UHF only.
+
+The scanner checks signal once per frequency and keeps weak multiplexes as
+comments. Use `--include-weak` to keep those services enabled. If the driver
+reports a lock without C/N in dB, the scanner keeps the services and reports
+the missing measurement.
 
 Review the candidate and install it where the service can read it. For a
 systemd install whose service group is `ferrofin`, for example:

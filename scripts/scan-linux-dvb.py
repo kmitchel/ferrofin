@@ -7,6 +7,7 @@
 
 from argparse import ArgumentParser, ArgumentTypeError
 from concurrent.futures import ThreadPoolExecutor
+from html import unescape
 import os
 from pathlib import Path
 import re
@@ -14,6 +15,8 @@ import shutil
 import statistics
 import subprocess
 import tempfile
+from urllib.parse import urlencode
+from urllib.request import urlopen
 
 
 def rf_frequency(channel):
@@ -34,6 +37,49 @@ def rf_channel(value):
     if not 2 <= channel <= 36:
         raise ArgumentTypeError("RF channel must be from 2 to 36")
     return channel
+
+
+def zip_code(value):
+    if not re.fullmatch(r"[0-9]{5}", value):
+        raise ArgumentTypeError("ZIP code must contain exactly five digits")
+    return value
+
+
+def parse_rf_hints(page):
+    channels = set()
+    for cell in re.findall(r"<td\b[^>]*>([^<]*)</td\s*>", page, re.IGNORECASE):
+        # RabbitEars cells show the virtual channel followed by the physical RF channel.
+        match = re.fullmatch(r"\s*[0-9]+[-\u2011.][0-9]+\s*\(([0-9]{1,2})\)\s*", unescape(cell))
+        if match and 2 <= (channel := int(match[1])) <= 36:
+            channels.add(channel)
+    return channels
+
+
+def lookup_rf_hints(zipcode):
+    query = urlencode({"request": "zip_search", "zipcode": zipcode})
+    limit = 8 * 1024 * 1024
+    with urlopen(f"https://www.rabbitears.info/search.php?{query}", timeout=15) as response:
+        page = response.read(limit + 1)
+    if len(page) > limit:
+        raise ValueError("RabbitEars response exceeded 8 MiB")
+    return parse_rf_hints(page.decode("utf-8", errors="replace"))
+
+
+def select_channels(rf, zipcode, skip_vhf):
+    allowed = set(range(14 if skip_vhf else 2, 37))
+    if rf is not None:
+        return sorted(allowed.intersection(rf))
+    if zipcode is not None:
+        try:
+            hints = allowed.intersection(lookup_rf_hints(zipcode))
+        except (OSError, ValueError) as error:
+            print(f"RabbitEars lookup failed ({error}); scanning the full selected band.")
+        else:
+            if hints:
+                print(f"RabbitEars ZIP {zipcode}: scanning {len(hints)} candidate RF channels.")
+                return sorted(hints)
+            print("RabbitEars returned no usable RF channels; scanning the full selected band.")
+    return sorted(allowed)
 
 
 def scan(adapter, channels, work):
@@ -149,17 +195,15 @@ def main():
     parser.add_argument("output", type=Path, help="path for the generated channels.conf")
     parser.add_argument("--adapter", type=int, action="append",
                         help="adapter number, repeat for parallel scans; default: all detected")
-    parser.add_argument("--rf", type=rf_channel, nargs="+",
-                        help="scan only these RF channels; default: 2 through 36")
+    frequencies = parser.add_mutually_exclusive_group()
+    frequencies.add_argument("--rf", type=rf_channel, nargs="+",
+                             help="scan only these RF channels; default: 2 through 36")
+    frequencies.add_argument("--zip", type=zip_code, metavar="ZIP",
+                             help="use RabbitEars RF channel hints for a five-digit U.S. ZIP code")
     parser.add_argument("--skip-vhf", action="store_true", help="skip RF channels 2 through 13")
     parser.add_argument("--include-weak", action="store_true",
                         help="keep multiplexes below 20 dB C/N or without a measured lock")
     args = parser.parse_args()
-    channels = sorted(set(args.rf or range(2, 37)))
-    if args.skip_vhf:
-        channels = [channel for channel in channels if channel >= 14]
-    if not channels:
-        parser.error("no RF channels selected")
     for program in ("dvbv5-scan", "dvbv5-zap"):
         if not shutil.which(program):
             parser.error(f"{program} is required (install v4l-utils)")
@@ -171,7 +215,6 @@ def main():
     adapters = sorted(set(args.adapter if args.adapter is not None else detected))
     if not adapters or any(adapter not in detected for adapter in adapters):
         parser.error("no requested DVB adapters are accessible; check /dev/dvb permissions")
-    adapters = adapters[:len(channels)]
     output = args.output.absolute()
     if not output.parent.is_dir():
         parser.error(f"output directory does not exist: {output.parent}")
@@ -179,6 +222,11 @@ def main():
         parser.error("output must be a regular file path")
     if output.exists():
         parser.error(f"{output} already exists; scan to a new path and install it after review")
+
+    channels = select_channels(args.rf, args.zip, args.skip_vhf)
+    if not channels:
+        parser.error("no RF channels selected")
+    adapters = adapters[:len(channels)]
 
     try:
         with tempfile.TemporaryDirectory(prefix="ferrofin-dvb-scan-") as directory:
