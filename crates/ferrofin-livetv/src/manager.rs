@@ -3227,8 +3227,7 @@ impl LiveTvManager for FerrofinLiveTvManager {
             _ => Uuid::new_v4().simple().to_string(),
         };
         info.id = Some(id.clone());
-        let url = info.url.clone().unwrap_or_default();
-        if url.is_empty() {
+        if info.url.as_deref().is_none_or(str::is_empty) {
             return Err(ServiceError::InvalidInput(
                 "tuner host Url is required".into(),
             ));
@@ -3246,7 +3245,7 @@ impl LiveTvManager for FerrofinLiveTvManager {
             &self.db,
             stored.as_deref(),
             &id,
-            &url,
+            info.url.as_deref().unwrap_or_default(),
             &type_id,
             &data,
         )

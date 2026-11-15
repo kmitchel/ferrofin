@@ -646,10 +646,12 @@ impl Drop for PendingSharedOpen {
         if let Some(task) = self.task.take() {
             task.abort();
             let path = self.temp_path.clone();
-            tokio::spawn(async move {
-                let _ = task.await;
-                let _ = tokio::fs::remove_file(path).await;
-            });
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(async move {
+                    let _ = task.await;
+                    let _ = tokio::fs::remove_file(path).await;
+                });
+            }
         }
     }
 }
