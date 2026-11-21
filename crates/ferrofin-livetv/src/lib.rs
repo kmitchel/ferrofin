@@ -40,6 +40,7 @@ pub mod recording_metadata;
 mod recording_postprocess;
 pub mod schedules_direct;
 pub mod stream;
+mod titantv;
 pub mod tuner_host;
 pub mod xmltv;
 pub mod xmltv_cache;

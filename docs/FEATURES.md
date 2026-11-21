@@ -125,7 +125,8 @@ Checked against a real Jellyfin server by the retired v2 runtime diff:
 - **Live TV** — M3U **and HDHomeRun** tuners + XMLTV **and Schedules Direct** guides,
   channels/programs, DB-backed DVR timers & recordings, with each recording folder a library of
   its own, so a finished recording is scanned like any other media. A recording in progress is
-  listed by `/LiveTv/Recordings` and joins its library when it ends. The Schedules Direct provider is a
+  listed by `/LiveTv/Recordings` and joins its library when it ends. For TitanTV listings, see
+  [Use TitanTV for the Live TV guide](TITANTV.md). The Schedules Direct provider is a
   port of Jellyfin 12.2's `SchedulesDirect` (login, lineups, the station map, schedules,
   program details and artwork, SD's error codes and daily limits); it is verified against
   Jellyfin's own JSON fixtures and a fake SD API, and **has not been run against a real
