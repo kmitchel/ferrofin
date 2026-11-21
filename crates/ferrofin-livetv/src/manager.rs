@@ -66,6 +66,7 @@ use crate::projection::{
 };
 use crate::schedules_direct::{SchedulesDirect, SdChannel, SdProgram};
 use crate::stream::{LiveStreamHandle, LiveStreamKind, TunerStreamSource};
+use crate::titantv::{self, TitanTv};
 use crate::xmltv::{Xmltv, XmltvChannel, XmltvProgramme, read_xmltv_each};
 use crate::xmltv_cache::XmlTvDocument;
 
@@ -276,6 +277,7 @@ fn add_provider_metadata(
                 EpgChannelData::new(&channels.iter().map(epg_channel).collect::<Vec<_>>())
             }
             GuideSource::SchedulesDirect { channels, .. } => EpgChannelData::new(channels),
+            GuideSource::TitanTv(guide) => EpgChannelData::new(&guide.channels),
         };
         for (host_id, lineup) in lineups.iter_mut() {
             if !is_listing_provider_enabled_for_tuner(provider, host_id) {
@@ -547,6 +549,7 @@ pub struct FerrofinLiveTvManager {
     /// The Schedules Direct listings provider (and its country list), sharing
     /// the fetcher and caching under the application cache directory.
     schedules_direct: SchedulesDirect,
+    titantv: TitanTv,
     /// The XMLTV document cache every guide reader goes through
     /// (`XmlTvListingsProvider.GetXml`).
     xmltv: crate::xmltv_cache::XmlTvCache,
@@ -620,6 +623,7 @@ enum ListingsBackend {
     XmlTv,
     /// `SchedulesDirect` (`Type` `SchedulesDirect`).
     SchedulesDirect,
+    TitanTv,
 }
 
 impl ListingsBackend {
@@ -632,6 +636,7 @@ impl ListingsBackend {
             Some(t) if eq_ordinal_ignore_case(t, crate::schedules_direct::PROVIDER_TYPE) => {
                 Ok(Self::SchedulesDirect)
             }
+            Some(t) if eq_ordinal_ignore_case(t, titantv::PROVIDER_TYPE) => Ok(Self::TitanTv),
             other => Err(ServiceError::not_found(format!(
                 "Couldn't find provider of type {}",
                 other.unwrap_or_default()
@@ -644,6 +649,7 @@ impl ListingsBackend {
         match self {
             Self::XmlTv => "XmlTV",
             Self::SchedulesDirect => crate::schedules_direct::PROVIDER_NAME,
+            Self::TitanTv => titantv::PROVIDER_TYPE,
         }
     }
 }
@@ -693,11 +699,22 @@ enum GuideSource {
         channels: Vec<EpgChannel>,
         programs: HashMap<String, Vec<SdProgram>>,
     },
+    TitanTv(titantv::Guide),
+}
+
+fn titantv_flag(value: Option<&str>, code: &str, label: &str) -> bool {
+    nonblank(value)
+        .is_some_and(|flag| flag.eq_ignore_ascii_case(code) || flag.eq_ignore_ascii_case(label))
+}
+
+fn nonblank(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
 }
 
 /// The programme columns a listings provider supplies as they are, borrowed
 /// from its own record (an XMLTV `<programme>` or a Schedules Direct
 /// `ProgramInfo`).
+#[derive(Clone, Copy)]
 struct ProgramFields<'a> {
     title: &'a str,
     overview: Option<&'a str>,
@@ -988,6 +1005,74 @@ impl CategoryClasses {
     /// `ToUpperInvariant` maps to `S`).
     fn any_in(list: &[String], categories: &[String]) -> bool {
         categories.iter().any(|c| list.contains(c))
+    }
+
+    fn classify_titantv(
+        &self,
+        program: &titantv::Program,
+        airing: &str,
+        categories: &[String],
+    ) -> ProgramClass {
+        let event = &program.event;
+        let is_movie = Self::any_in(&self.movie, categories);
+        let is_news = Self::any_in(&self.news, categories);
+        let episode_title = nonblank(event.episode_title.as_deref())
+            .map(str::to_owned)
+            .filter(|_| !is_movie);
+        let season_number = event
+            .season_number
+            .filter(|number| !is_movie && *number > 0);
+        let episode_number = event
+            .season_episode_number
+            .filter(|number| !is_movie && *number > 0);
+        let is_series = !is_movie
+            && (is_news
+                || episode_title.is_some()
+                || episode_number.is_some()
+                || event
+                    .program_type
+                    .as_deref()
+                    .is_some_and(|kind| kind.eq_ignore_ascii_case("series")));
+        let marker = nonblank(event.new_repeat.as_deref());
+        let is_repeat = titantv_flag(marker, "R", "Repeat")
+            || (marker.is_none()
+                && is_series
+                && event.originally_aired_before(
+                    program.start.with_timezone(&chrono::Local).date_naive(),
+                ));
+        let show_id = if let Some(id) = event
+            .program_id
+            .filter(|id| *id > 0 && (!is_series || is_repeat || episode_number.is_some()))
+        {
+            format!("titantv_{id}")
+        } else {
+            airing.to_owned()
+        };
+        let external_series_id = is_series.then(|| {
+            event.parent_program_id.filter(|id| *id > 0).map_or_else(
+                || {
+                    format!(
+                        "titantv_{}",
+                        ferrofin_common::extensions::get_md5(&event.title).simple()
+                    )
+                },
+                |id| format!("titantv_{id}"),
+            )
+        });
+        ProgramClass {
+            is_movie,
+            is_series,
+            is_news,
+            is_kids: Self::any_in(&self.kids, categories),
+            is_sports: Self::any_in(&self.sports, categories),
+            is_repeat,
+            episode_title,
+            season_number,
+            episode_number,
+            external_id: Some(airing.to_owned()),
+            external_series_id,
+            show_id,
+        }
     }
 
     /// `ProgramInfo.ShowId` for one airing, as
@@ -1291,6 +1376,7 @@ impl FerrofinLiveTvManager {
                     .sharing_local_network(Arc::clone(&local_network)),
             ),
         ];
+        let titantv = TitanTv::new(Arc::clone(&fetcher));
         let schedules_direct = SchedulesDirect::new(fetcher, cache_dir);
         Self {
             db,
@@ -1327,6 +1413,7 @@ impl FerrofinLiveTvManager {
             guide_lock: Arc::new(tokio::sync::Mutex::new(())),
             refresh_generation: Arc::new(AtomicU64::new(0)),
             schedules_direct,
+            titantv,
             xmltv,
         }
     }
@@ -2453,15 +2540,19 @@ impl FerrofinLiveTvManager {
         &self,
         info: &ListingsProviderInfo,
     ) -> Result<Vec<EpgChannel>, ServiceError> {
-        if ListingsBackend::of(info.type_.as_deref())? == ListingsBackend::SchedulesDirect {
-            return Ok(self
-                .schedules_direct
-                .get_channels(info)
-                .await?
-                .unwrap_or_default()
-                .into_iter()
-                .map(sd_epg_channel)
-                .collect());
+        match ListingsBackend::of(info.type_.as_deref())? {
+            ListingsBackend::SchedulesDirect => {
+                return Ok(self
+                    .schedules_direct
+                    .get_channels(info)
+                    .await?
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(sd_epg_channel)
+                    .collect());
+            }
+            ListingsBackend::TitanTv => return self.titantv.channels(info).await,
+            ListingsBackend::XmlTv => {}
         }
         // `GetXml` rethrows what failed when no copy is cached. A file or
         // directory that is not there, the guide or the cache file it writes,
@@ -2923,6 +3014,84 @@ impl FerrofinLiveTvManager {
         self.write_program_rows(rows, &touched).await
     }
 
+    async fn insert_titantv_programs(
+        &self,
+        guide: &titantv::Guide,
+        provider: &ListingsProviderInfo,
+    ) -> Result<HashMap<Uuid, ProgramImages>, ServiceError> {
+        let by_station = self.bind_guide_channels(&guide.channels, provider).await?;
+        // A partial fetch can update known airings, but cannot tell us
+        // which of the remaining stored airings have been removed.
+        let touched: Vec<_> = if guide.complete {
+            by_station
+                .values()
+                .flatten()
+                .map(|(stored, _)| stored.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let classes = CategoryClasses::from_provider(provider);
+        let rows: ProgramRows<'_> =
+            Box::new(guide.programs.iter().flat_map(|(station, programs)| {
+                let channels = by_station.get(station).map_or(&[][..], Vec::as_slice);
+                let classes = &classes;
+                programs.iter().flat_map(move |program| {
+                    let event = &program.event;
+                    let airing = format!("titantv_{station}_{}", program.start.timestamp());
+                    let genres: Vec<_> = [
+                        nonblank(event.display_genre.as_deref()),
+                        nonblank(event.program_type.as_deref()),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                    let categories: Vec<_> = genres
+                        .iter()
+                        .map(|name| ferrofin_util::string_extensions::upper_invariant(name))
+                        .collect();
+                    let class = classes.classify_titantv(program, &airing, &categories);
+                    let genres = (!genres.is_empty())
+                        .then(|| serde_json::to_string(&genres).ok())
+                        .flatten();
+                    let start = datetime_to_db(program.start);
+                    let end = Some(datetime_to_db(program.end));
+                    let fields = ProgramFields {
+                        title: &event.title,
+                        overview: nonblank(event.description.as_deref())
+                            .or_else(|| nonblank(event.series_description.as_deref())),
+                        image_url: nonblank(event.show_card.as_deref()),
+                        production_year: event.year.filter(|year| *year > 0),
+                        episode_num: None,
+                        is_new: titantv_flag(event.new_repeat.as_deref(), "N", "New"),
+                        is_premiere: titantv_flag(event.new_repeat.as_deref(), "P", "Premiere"),
+                        official_rating: nonblank(event.tv_rating.as_deref())
+                            .or_else(|| nonblank(event.mpaa_rating.as_deref())),
+                        is_live: titantv_flag(event.live_tape_replay.as_deref(), "L", "Live"),
+                    };
+                    channels.iter().map(move |(channel_id, channel_external)| {
+                        let external_id = format!("{airing}_{channel_external}");
+                        ProgramRow {
+                            id: internal_program_id(&external_id),
+                            channel_id,
+                            external_id: Some(external_id),
+                            start: start.clone(),
+                            end: end.clone(),
+                            genres: genres.clone(),
+                            class: class.clone(),
+                            images: ProgramImages {
+                                primary: fields.image_url.map(str::to_owned),
+                                ..ProgramImages::default()
+                            },
+                            listing: ProgramListing::default(),
+                            fields,
+                        }
+                    })
+                })
+            }));
+        self.write_program_rows(rows, &touched).await
+    }
+
     /// Whether a refresh newer than `generation` has started.
     fn superseded(&self, generation: u64) -> bool {
         self.refresh_generation.load(Ordering::SeqCst) != generation
@@ -2961,6 +3130,25 @@ impl FerrofinLiveTvManager {
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "live tv: Schedules Direct guide fetch failed");
+                        (None, false)
+                    }
+                },
+            );
+        }
+        if backend == ListingsBackend::TitanTv {
+            return Ok(
+                match self
+                    .titantv
+                    .guide(provider, window, || self.superseded(generation))
+                    .await
+                {
+                    Ok(Some(guide)) => {
+                        let complete = guide.complete;
+                        (Some(GuideSource::TitanTv(guide)), complete)
+                    }
+                    Ok(None) => (None, false),
+                    Err(error) => {
+                        tracing::warn!(%error, "live tv: TitanTV guide fetch failed; keeping the stored guide");
                         (None, false)
                     }
                 },
@@ -3521,6 +3709,9 @@ impl LiveTvManager for FerrofinLiveTvManager {
         // anything is stored.
         match ListingsBackend::of(info.type_.as_deref())? {
             ListingsBackend::XmlTv => self.validate_xmltv(&info).await?,
+            ListingsBackend::TitanTv => {
+                self.titantv.channels(&info).await?;
+            }
             ListingsBackend::SchedulesDirect => {
                 self.schedules_direct
                     .validate(&info, validate_login, validate_listings)
@@ -4103,6 +4294,9 @@ impl LiveTvManager for FerrofinLiveTvManager {
                 GuideSource::SchedulesDirect { channels, programs } => {
                     self.insert_schedules_direct_programs(&channels, &programs, &provider)
                         .await?
+                }
+                GuideSource::TitanTv(guide) => {
+                    self.insert_titantv_programs(&guide, &provider).await?
                 }
             };
             // Extending an empty map reserves a second table the size of
@@ -9609,6 +9803,156 @@ mod tests {
         assert_eq!(source.media_streams[0].height, Some(1080));
         assert_eq!(source.media_streams[0].bit_rate, Some(15_000_000));
         assert_eq!(source.media_streams[1].bit_rate, Some(448_000));
+    }
+
+    #[tokio::test]
+    async fn titantv_refresh_imports_programmes_and_retains_them_on_api_failure() {
+        struct TitanTvFetcher {
+            now: chrono::DateTime<Utc>,
+            mode: std::sync::atomic::AtomicUsize,
+            schedule_calls: std::sync::atomic::AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl SourceFetcher for TitanTvFetcher {
+            async fn fetch(&self, url: &str) -> Result<String, ServiceError> {
+                if url == "http://tuner/playlist.m3u" {
+                    return Ok(M3U.to_owned());
+                }
+                let body = if url.starts_with("https://titantv.com/api/channel/") {
+                    serde_json::json!({
+                        "errorCode": 0,
+                        "channels": [{
+                            "channelIndex": 17, "channelId": 103, "majorChannel": 1,
+                            "callSign": "TEST"
+                        }]
+                    })
+                } else if url.starts_with("https://titantv.com/api/schedule/") {
+                    let mode = self.mode.load(std::sync::atomic::Ordering::Relaxed);
+                    let call = self
+                        .schedule_calls
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if mode == 2 || (mode == 1 && call == 3) {
+                        return Ok(r#"{"errorCode": 42, "errorMessage": "unavailable"}"#.to_owned());
+                    }
+                    let event = |title, start: chrono::DateTime<Utc>| {
+                        serde_json::json!({
+                            "title": title, "displayGenre": "News",
+                            "programType": "Series", "programId": 24, "parentProgramId": 12,
+                            "newRepeat": "N", "originalAirDate": "2008-03-17",
+                            "startTime": start.to_rfc3339(),
+                            "endTime": (start + chrono::Duration::hours(1)).to_rfc3339(),
+                            "duration": 3600
+                        })
+                    };
+                    let mut events = vec![event(
+                        if mode == 0 {
+                            "Test News"
+                        } else {
+                            "Updated News"
+                        },
+                        self.now,
+                    )];
+                    if mode == 0 {
+                        let mut rerun =
+                            event("The Big Bang Theory", self.now + chrono::Duration::hours(8));
+                        rerun["episodeTitle"] = "The Cooper-Hofstadter Polarization".into();
+                        rerun["displayGenre"] = "Comedy".into();
+                        rerun["originalAirDate"] = "2008-03-17T00:00:00".into();
+                        rerun["newRepeat"] = "".into();
+                        events.push(rerun);
+                    }
+                    serde_json::json!({
+                        "errorCode": 0,
+                        "channels": [{"channelIndex": 17, "days": [{"events": events}]}]
+                    })
+                } else {
+                    return Err(ServiceError::backend("unexpected fixture request"));
+                };
+                Ok(body.to_string())
+            }
+        }
+
+        let fetcher = Arc::new(TitanTvFetcher {
+            mode: 0.into(),
+            schedule_calls: 0.into(),
+            now: Utc::now() + chrono::Duration::minutes(10),
+        });
+        let mgr = manager_with_fetcher(fetcher.clone()).await;
+        mgr.save_tuner_host(TunerHostInfo {
+            type_: Some("m3u".to_owned()),
+            url: Some("http://tuner/playlist.m3u".to_owned()),
+            ..TunerHostInfo::default()
+        })
+        .await
+        .expect("save tuner");
+        let provider = mgr
+            .save_listing_provider(
+                ListingsProviderInfo {
+                    type_: Some("TitanTV".to_owned()),
+                    username: Some("11111111-1111-4111-8111-111111111111".to_owned()),
+                    listings_id: Some("22222222-2222-4222-8222-222222222222".to_owned()),
+                    ..ListingsProviderInfo::default()
+                },
+                false,
+                false,
+            )
+            .await
+            .expect("save provider");
+        mgr.refresh_guide().await.expect("first refresh");
+        let options = mgr
+            .get_channel_mapping_options(provider.id.as_deref().expect("provider id"))
+            .await
+            .expect("channel mapping options");
+        assert_eq!(options.provider_name.as_deref(), Some("TitanTV"));
+        assert!(
+            options
+                .tuner_channels
+                .iter()
+                .any(|channel| { channel.provider_channel_id.as_deref() == Some("103") }),
+            "expected the refreshed tuner lineup to match TitanTV station 103"
+        );
+
+        let listings = || async {
+            sqlx::query_as::<_, (String, String, bool, bool, bool, bool)>(
+                r#"SELECT "Id", "Title", "IsNews", "IsSeries", "IsNew", "IsRepeat" FROM "FerrofinLiveTvPrograms" ORDER BY "StartDate""#,
+            )
+            .fetch_all(mgr.db.pool())
+            .await
+            .expect("stored airings")
+        };
+        let before = listings().await;
+        assert_eq!(
+            before.len(),
+            2,
+            "identical airings across blocks are deduplicated"
+        );
+        assert!(before[0].2 && before[0].3 && before[0].4 && !before[0].5);
+        assert_eq!(before[1].1, "The Big Bang Theory");
+        assert!(before[1].3 && !before[1].4 && before[1].5);
+        let first_calls = fetcher
+            .schedule_calls
+            .swap(0, std::sync::atomic::Ordering::Relaxed);
+        assert!((28..=29).contains(&first_calls));
+        fetcher.mode.store(1, std::sync::atomic::Ordering::Relaxed);
+        mgr.refresh_guide().await.expect("partial refresh");
+        let repeat_calls = fetcher
+            .schedule_calls
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            (4..=5).contains(&repeat_calls),
+            "fetched {repeat_calls} blocks"
+        );
+        let partial = listings().await;
+        assert_eq!(partial.len(), 2);
+        assert!(partial.iter().any(|row| row.1 == "Updated News"));
+        assert!(partial.iter().any(|row| row.1 == "The Big Bang Theory"));
+
+        fetcher.mode.store(2, std::sync::atomic::Ordering::Relaxed);
+        mgr.refresh_guide()
+            .await
+            .expect("refresh with upstream failure");
+        assert_eq!(listings().await, partial);
     }
 
     #[tokio::test]
