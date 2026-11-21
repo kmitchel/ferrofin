@@ -9805,74 +9805,74 @@ mod tests {
         assert_eq!(source.media_streams[1].bit_rate, Some(448_000));
     }
 
+    struct TitanTvFetcher {
+        now: chrono::DateTime<Utc>,
+        mode: std::sync::atomic::AtomicUsize,
+        schedule_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl SourceFetcher for TitanTvFetcher {
+        async fn fetch(&self, url: &str) -> Result<String, ServiceError> {
+            if url == "http://tuner/playlist.m3u" {
+                return Ok(M3U.to_owned());
+            }
+            let body = if url.starts_with("https://titantv.com/api/channel/") {
+                serde_json::json!({
+                    "errorCode": 0,
+                    "channels": [{
+                        "channelIndex": 17, "channelId": 103, "majorChannel": 1,
+                        "callSign": "TEST"
+                    }]
+                })
+            } else if url.starts_with("https://titantv.com/api/schedule/") {
+                let mode = self.mode.load(std::sync::atomic::Ordering::Relaxed);
+                let call = self
+                    .schedule_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if mode == 2 || (mode == 1 && call == 3) {
+                    return Ok(r#"{"errorCode": 42, "errorMessage": "unavailable"}"#.to_owned());
+                }
+                let event = |title, start: chrono::DateTime<Utc>| {
+                    serde_json::json!({
+                        "title": title, "displayGenre": "News",
+                        "programType": "Series", "programId": 24, "parentProgramId": 12,
+                        "newRepeat": "N", "originalAirDate": "2008-03-17",
+                        "startTime": start.to_rfc3339(),
+                        "endTime": (start + chrono::Duration::hours(1)).to_rfc3339(),
+                        "duration": 3600
+                    })
+                };
+                let mut events = vec![event(
+                    if mode == 0 {
+                        "Test News"
+                    } else {
+                        "Updated News"
+                    },
+                    self.now,
+                )];
+                if mode == 0 {
+                    let mut rerun =
+                        event("The Big Bang Theory", self.now + chrono::Duration::hours(8));
+                    rerun["episodeTitle"] = "The Cooper-Hofstadter Polarization".into();
+                    rerun["displayGenre"] = "Comedy".into();
+                    rerun["originalAirDate"] = "2008-03-17T00:00:00".into();
+                    rerun["newRepeat"] = "".into();
+                    events.push(rerun);
+                }
+                serde_json::json!({
+                    "errorCode": 0,
+                    "channels": [{"channelIndex": 17, "days": [{"events": events}]}]
+                })
+            } else {
+                return Err(ServiceError::backend("unexpected fixture request"));
+            };
+            Ok(body.to_string())
+        }
+    }
+
     #[tokio::test]
     async fn titantv_refresh_imports_programmes_and_retains_them_on_api_failure() {
-        struct TitanTvFetcher {
-            now: chrono::DateTime<Utc>,
-            mode: std::sync::atomic::AtomicUsize,
-            schedule_calls: std::sync::atomic::AtomicUsize,
-        }
-
-        #[async_trait::async_trait]
-        impl SourceFetcher for TitanTvFetcher {
-            async fn fetch(&self, url: &str) -> Result<String, ServiceError> {
-                if url == "http://tuner/playlist.m3u" {
-                    return Ok(M3U.to_owned());
-                }
-                let body = if url.starts_with("https://titantv.com/api/channel/") {
-                    serde_json::json!({
-                        "errorCode": 0,
-                        "channels": [{
-                            "channelIndex": 17, "channelId": 103, "majorChannel": 1,
-                            "callSign": "TEST"
-                        }]
-                    })
-                } else if url.starts_with("https://titantv.com/api/schedule/") {
-                    let mode = self.mode.load(std::sync::atomic::Ordering::Relaxed);
-                    let call = self
-                        .schedule_calls
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if mode == 2 || (mode == 1 && call == 3) {
-                        return Ok(r#"{"errorCode": 42, "errorMessage": "unavailable"}"#.to_owned());
-                    }
-                    let event = |title, start: chrono::DateTime<Utc>| {
-                        serde_json::json!({
-                            "title": title, "displayGenre": "News",
-                            "programType": "Series", "programId": 24, "parentProgramId": 12,
-                            "newRepeat": "N", "originalAirDate": "2008-03-17",
-                            "startTime": start.to_rfc3339(),
-                            "endTime": (start + chrono::Duration::hours(1)).to_rfc3339(),
-                            "duration": 3600
-                        })
-                    };
-                    let mut events = vec![event(
-                        if mode == 0 {
-                            "Test News"
-                        } else {
-                            "Updated News"
-                        },
-                        self.now,
-                    )];
-                    if mode == 0 {
-                        let mut rerun =
-                            event("The Big Bang Theory", self.now + chrono::Duration::hours(8));
-                        rerun["episodeTitle"] = "The Cooper-Hofstadter Polarization".into();
-                        rerun["displayGenre"] = "Comedy".into();
-                        rerun["originalAirDate"] = "2008-03-17T00:00:00".into();
-                        rerun["newRepeat"] = "".into();
-                        events.push(rerun);
-                    }
-                    serde_json::json!({
-                        "errorCode": 0,
-                        "channels": [{"channelIndex": 17, "days": [{"events": events}]}]
-                    })
-                } else {
-                    return Err(ServiceError::backend("unexpected fixture request"));
-                };
-                Ok(body.to_string())
-            }
-        }
-
         let fetcher = Arc::new(TitanTvFetcher {
             mode: 0.into(),
             schedule_calls: 0.into(),
